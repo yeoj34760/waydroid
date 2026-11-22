@@ -154,6 +154,16 @@ def make_prop(args, cfg, full_props_path):
     if dpi != "0":
         props.append("ro.sf.lcd_density=" + dpi)
 
+    # waydroid-nvidia-prolapse: SurfaceFlinger's vsync snap window for the display modes the host
+    # drives now (read here, at every container start, like hwcomposer reads its wl_outputs):
+    # nvidia_native.session_properties
+    from tools.helpers import nvidia_native
+    if nvidia_native.driver_mode(tools.config.load(args)["waydroid"]) is not None:
+        rates, notes = nvidia_native.active_refresh_rates()
+        props, more = nvidia_native.session_properties(props, rates)
+        for note in notes + more:
+            logging.info(note)
+
     with open(full_props_path, "w") as f:
         for prop in props:
             f.write(prop + "\n")

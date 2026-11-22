@@ -129,6 +129,11 @@ def setup_config(args):
     cfg["waydroid"]["vendor_type"] = args.vendor_type
     cfg["waydroid"]["system_ota"] = args.system_ota
     cfg["waydroid"]["vendor_ota"] = args.vendor_ota
+    # waydroid-nvidia: a fresh cfg gets the default NVIDIA driver mode written explicitly (announced).
+    from tools.helpers import nvidia_native
+    written = nvidia_native.init_defaults(cfg["waydroid"])
+    if written:
+        logging.info(written)
     tools.config.save(args, cfg)
     return True
 
@@ -171,6 +176,10 @@ def init(args):
         os.mkdir(tools.config.defaults["overlay_rw"]+"/vendor")
     helpers.drivers.probeAshmemDriver(args)
     helpers.lxc.setup_host_perms(args)
+    # waydroid-nvidia: init installs official images only, waydroid-nvidia-setup installs the nvidia-prolapse vendor
+    # image afterwards. Meanwhile the generator defers that install's entries (nvidia_native.init_nodes) and sets
+    # args.nvidia_pending; the container start refuses until the setup ran (nvidia_native.check_start).
+    args.nvidia_init = True
     helpers.lxc.set_lxc_config(args)
     helpers.lxc.make_base_props(args)
     if status != "STOPPED":
@@ -183,6 +192,9 @@ def init(args):
         except Exception as e:
             logging.debug(e)
             logging.error("Failed to restart container. Please do so manually.")
+    if getattr(args, "nvidia_pending", None):
+        from tools.helpers import nvidia_native
+        logging.warning(nvidia_native.INIT_NEXT_STEP)
 
 class DbusInitializer(dbus.service.Object):
     def __init__(self, looper, bus, object_path, args):

@@ -125,16 +125,45 @@ def generate_nodes_lxc_config(args):
     make_entry("/system/etc/libnfc-nci.conf", options="bind,optional 0 0")
 
     # NVIDIA Venus stack: host venus socket dir and our replacement guest
-    # libraries, bind-mounted over the image. Emitted only when
-    # nvidia_venus_socket is configured (written by waydroid-nvidia-setup),
+    # libraries, bind-mounted over the image. Emitted only in
+    # nvidia_driver_mode = venus (socket: nvidia_native.VENUS_SOCKET),
     # and deliberately NOT 'optional': a missing piece must fail container
     # start loudly instead of surfacing as an opaque SurfaceFlinger crash
     # loop deep inside the guest.
     cfg = tools.config.load(args)
-    venus_socket = cfg["waydroid"].get("nvidia_venus_socket")
-    if venus_socket:
-        venus_dir = os.path.dirname(venus_socket)
-        nodes.append("lxc.mount.entry = {} dev/venus none rbind,create=dir 0 0".format(venus_dir))
+    # waydroid-nvidia-prolapse: the driver is chosen explicitly by [waydroid] nvidia_driver_mode
+    # (nvidia-prolapse | glibc-shim | venus; nvidia_native.driver_mode() refuses anything ambiguous).
+    # venus = exactly the baseline's mounts below. glibc-shim and nvidia-prolapse's dev-root reuse
+    # ANGLE, hwcomposer and surfaceflinger from the guest layout below, but bring their own Vulkan
+    # HAL and gralloc backend: the Venus-only pieces are not mounted. ANGLE's files are bound by
+    # nvidia_native.lxc_nodes() instead, after the staged /vendor/lib{,64}/egl directory that
+    # would otherwise hide them. nvidia-prolapse's vendor-image install (driver.guest_layout False)
+    # binds nothing from the guest layout: every component is in its vendor.img.
+    from tools.helpers import nvidia_native
+    driver = nvidia_native.driver_mode(cfg["waydroid"])
+    if driver is not None:
+        logging.info(nvidia_native.announce(driver))
+        nvidia_native.check_properties(cfg["properties"], driver)
+    if driver is not None and driver.mode == "venus":
+        nvidia_native.check_venus(driver, cfg["waydroid"])
+    native = driver is not None and driver.native
+    guest_layout = driver is not None and driver.guest_layout
+    venus_socket = driver.venus_socket if driver is not None and driver.mode == "venus" else None
+    not_in_native = (
+        "vendor/lib/hw/vulkan.virtio.so",
+        "vendor/lib64/hw/vulkan.virtio.so",
+        "vendor/lib64/libgbm_mesa_wrapper.so",
+        "vendor/lib/egl/libEGL_angle.so",
+        "vendor/lib/egl/libGLESv1_CM_angle.so",
+        "vendor/lib/egl/libGLESv2_angle.so",
+        "vendor/lib64/egl/libEGL_angle.so",
+        "vendor/lib64/egl/libGLESv1_CM_angle.so",
+        "vendor/lib64/egl/libGLESv2_angle.so",
+    )
+    if venus_socket or (native and guest_layout):
+        if venus_socket and not native:
+            venus_dir = os.path.dirname(venus_socket)
+            nodes.append("lxc.mount.entry = {} dev/venus none rbind,create=dir 0 0".format(venus_dir))
         if cfg["waydroid"].get("nvidia_guest_layout") == "2":
             guest_root = "/var/lib/waydroid/nv/guest"
             guest_files = (
@@ -151,9 +180,15 @@ def generate_nodes_lxc_config(args):
                 "system/bin/surfaceflinger",
             )
             for guest_file in guest_files:
+                if guest_file in not_in_native and native:
+                    continue
                 nodes.append(
                     "lxc.mount.entry = {}/{} {} none rbind,create=file 0 0".format(
                         guest_root, guest_file, guest_file))
+        elif native:
+            raise OSError("NVIDIA native mode reuses ANGLE, hwcomposer and surfaceflinger from "
+                          "/var/lib/waydroid/nv/guest and needs nvidia_guest_layout = 2 in "
+                          "waydroid.cfg (provisioned by waydroid-nvidia-setup)")
         else:
             # Compatibility with installations provisioned before the dual-ABI
             # guest layout. The next setup run migrates them atomically.
@@ -164,6 +199,23 @@ def generate_nodes_lxc_config(args):
             nodes.append("lxc.mount.entry = /var/lib/waydroid/nv/libGLESv1_CM_angle.so vendor/lib64/egl/libGLESv1_CM_angle.so none rbind,create=file 0 0")
             nodes.append("lxc.mount.entry = /var/lib/waydroid/nv/libGLESv2_angle.so vendor/lib64/egl/libGLESv2_angle.so none rbind,create=file 0 0")
             nodes.append("lxc.mount.entry = /var/lib/waydroid/nv/surfaceflinger system/bin/surfaceflinger none rbind,create=file 0 0")
+
+    # NVIDIA driver modes (waydroid-nvidia-prolapse, nvidia_native.mode_nodes): nvidia-prolapse's
+    # vendor image gets the /dev/nvidia* nodes and this GPU's Codec2 listing, after checking that
+    # the booted vendor.img is the one the setup gated on the loaded kernel module. glibc-shim and
+    # dev-root get their staged root (/vendor_extra, gralloc, the staged /vendor/lib{,64}/egl) and
+    # the nodes, and refuse our vendor image. Every entry is mandatory and every missing piece
+    # raises with its name and remedy, as does a [properties] section that sets a mode-derived
+    # property. Exception: `waydroid init` (args.nvidia_init) runs before waydroid-nvidia-setup has
+    # installed the vendor image, so there the vendor-image entries are deferred, not refused
+    # (nvidia_native.init_nodes), and start() below refuses until the setup ran.
+    if driver is not None and getattr(args, "nvidia_init", False):
+        entries, args.nvidia_pending = nvidia_native.init_nodes(driver, cfg["waydroid"], existing=nodes)
+        if args.nvidia_pending:
+            logging.warning(args.nvidia_pending)
+        nodes.extend(entries)
+    elif driver is not None:
+        nodes.extend(nvidia_native.mode_nodes(driver, cfg["waydroid"], existing=nodes))
 
     return nodes
 
@@ -433,8 +485,18 @@ def make_base_props(args):
     if prop_fp != "":
         props.append("ro.build.fingerprint=" + prop_fp)
 
-    # now append/override with values in [properties] section of waydroid.cfg
+    # waydroid-nvidia-prolapse: properties derived from nvidia_driver_mode/nvidia_native_gl and the
+    # deployment (ro.hardware.vulkan/egl, zygote preload, Venus socket, the Codec2 listing of a root
+    # with the NVDEC decoder: nvidia_native.mode_properties). They replace Waydroid's own values
+    # above; [properties] may not set them (check_properties).
     cfg = tools.config.load(args)
+    from tools.helpers import nvidia_native
+    driver = nvidia_native.driver_mode(cfg["waydroid"])
+    if driver is not None:
+        nvidia_native.check_properties(cfg["properties"], driver)
+        props = nvidia_native.apply_mode_properties(props, driver)
+
+    # now append/override with values in [properties] section of waydroid.cfg
     for k, v in cfg["properties"].items():
         for idx, elem in enumerate(props):
             if (k+"=") in elem:
@@ -494,6 +556,18 @@ def wait_for_running(args):
         raise OSError("container failed to start")
 
 def start(args):
+    # waydroid-nvidia-prolapse: name the NVIDIA driver mode in the container log, refuse a
+    # waydroid_base.prop generated for another mode (cfg switched without 'upgrade -o'), and in the
+    # vendor-image install refuse a vendor.img other than the gated one, or the entries `waydroid
+    # init` deferred before the setup installed it (nvidia_native.check_start).
+    from tools.helpers import nvidia_native
+    waydroid_cfg = tools.config.load(args)["waydroid"]
+    driver = nvidia_native.driver_mode(waydroid_cfg)
+    if driver is not None:
+        logging.info(nvidia_native.announce(driver))
+        nvidia_native.check_base_prop(args.work + "/waydroid_base.prop", driver)
+        nvidia_native.check_start(driver, waydroid_cfg,
+                                  os.path.join(tools.config.defaults["lxc"], "waydroid", "config_nodes"))
     command = ["lxc-start", "-P", tools.config.defaults["lxc"],
                "-F", "-n", "waydroid", "--", "/init"]
     tools.helpers.run.user(args, command, output="background")
