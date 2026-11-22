@@ -71,6 +71,12 @@ _ifup() {
     ip addr add ${CIDR_ADDR} broadcast + dev ${LXC_BRIDGE}
     ip link set dev ${LXC_BRIDGE} address $LXC_BRIDGE_MAC
     ip link set dev ${LXC_BRIDGE} up
+    # firewalld drops the container's DHCP and DNS on an interface outside a permissive zone (Fedora's own
+    # package adds this call too); only where firewalld runs
+    if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+        firewall-cmd --zone=trusted --add-interface=${LXC_BRIDGE} >/dev/null ||
+            echo "waydroid-net: firewalld refused ${LXC_BRIDGE} in the trusted zone; Android gets no network until it is (firewall-cmd --zone=trusted --add-interface=${LXC_BRIDGE})" >&2
+    fi
 }
 
 start_ipv6() {

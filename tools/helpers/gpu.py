@@ -23,10 +23,10 @@ def getDriNode(args):
     if node:
         if not os.path.exists(node):
             raise OSError("The specified drm_device {} does not exist".format(node))
+        # An explicitly configured drm_device is trusted as-is; the
+        # unsupported blacklist only guards auto-detection below.
         renderDev = os.path.basename(node)
-        if getKernelDriver(args, renderDev) not in unsupported:
-            return node, getCardFromRender(args, renderDev)
-        return "", ""
+        return node, getCardFromRender(args, renderDev)
 
     for node in sorted(glob.glob("/dev/dri/renderD*")):
         renderDev = os.path.basename(node)

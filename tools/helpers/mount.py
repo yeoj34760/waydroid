@@ -1,8 +1,34 @@
 # Copyright 2021 Oliver Smith
 # SPDX-License-Identifier: GPL-3.0-or-later
+import functools
+import logging
 import os
 import tools.helpers.run
 from tools.helpers.version import versiontuple, kernel_version
+
+# The Android images carry Android's file labels, which a host SELinux policy does not know (unlabeled_t). The waydroid
+# policy module (Fedora's, which waydroid-nvidia's install.sh loads where SELinux is enabled) labels the mounted rootfs
+# with this context instead; its container domain may enter and run it, and the container start may read it.
+ROOTFS_CONTEXT = "system_u:object_r:waydroid_rootfs_t:s0"
+
+
+@functools.lru_cache(maxsize=None)
+def rootfs_context():
+    """ROOTFS_CONTEXT when SELinux is enabled and the loaded policy defines it, else None. Asked of libselinux
+    (is_selinux_enabled, security_check_context); no libselinux means no SELinux."""
+    import ctypes
+    try:
+        libselinux = ctypes.CDLL("libselinux.so.1")
+    except OSError:
+        return None
+    if libselinux.is_selinux_enabled() != 1:
+        return None
+    if libselinux.security_check_context(ROOTFS_CONTEXT.encode()) == 0:
+        return ROOTFS_CONTEXT
+    logging.warning("SELinux is enabled, but the loaded policy has no {}: the Android rootfs stays unlabeled and "
+                    "an enforcing host refuses the container. Load the waydroid policy module (re-run "
+                    "waydroid-nvidia's install.sh)".format(ROOTFS_CONTEXT.split(":")[2]))
+    return None
 
 
 def ismount(folder):
@@ -135,6 +161,8 @@ def mount(args, source, destination, create_folders=True, umount=False,
 
     extra_args = []
     opt_args = []
+    if rootfs_context():
+        opt_args.append('context="{}"'.format(rootfs_context()))
     if mount_type:
         extra_args.extend(["-t", mount_type])
     if readonly:

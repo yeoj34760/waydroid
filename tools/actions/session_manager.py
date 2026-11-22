@@ -66,6 +66,22 @@ def start(args, unlocked_cb=None, background=True):
         logging.error(f"Wayland socket '{wayland_socket_path}' doesn't exist; are you running a Wayland compositor?")
         sys.exit(1)
 
+    # NVIDIA Venus mode (nvidia_venus_socket set by waydroid-nvidia-setup):
+    # the guest renders through this socket; without it SurfaceFlinger can
+    # only crash-loop. Refuse to start and say exactly what is wrong.
+    venus_socket = tools.config.load(args)["waydroid"].get("nvidia_venus_socket")
+    if venus_socket:
+        import socket as _socket
+        sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        try:
+            sock.connect(venus_socket)
+        except OSError as e:
+            logging.error(f"Venus render server socket '{venus_socket}' is not accepting connections ({e.strerror}).")
+            logging.error("Start it as your desktop user: systemctl --user enable --now wd-venus.service")
+            sys.exit(1)
+        finally:
+            sock.close()
+
     waydroid_data = session["waydroid_data"]
     if not os.path.isdir(waydroid_data):
         os.makedirs(waydroid_data)

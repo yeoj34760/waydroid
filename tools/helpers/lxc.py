@@ -124,6 +124,47 @@ def generate_nodes_lxc_config(args):
     # NFC config
     make_entry("/system/etc/libnfc-nci.conf", options="bind,optional 0 0")
 
+    # NVIDIA Venus stack: host venus socket dir and our replacement guest
+    # libraries, bind-mounted over the image. Emitted only when
+    # nvidia_venus_socket is configured (written by waydroid-nvidia-setup),
+    # and deliberately NOT 'optional': a missing piece must fail container
+    # start loudly instead of surfacing as an opaque SurfaceFlinger crash
+    # loop deep inside the guest.
+    cfg = tools.config.load(args)
+    venus_socket = cfg["waydroid"].get("nvidia_venus_socket")
+    if venus_socket:
+        venus_dir = os.path.dirname(venus_socket)
+        nodes.append("lxc.mount.entry = {} dev/venus none rbind,create=dir 0 0".format(venus_dir))
+        if cfg["waydroid"].get("nvidia_guest_layout") == "2":
+            guest_root = "/var/lib/waydroid/nv/guest"
+            guest_files = (
+                "vendor/lib/hw/vulkan.virtio.so",
+                "vendor/lib/egl/libEGL_angle.so",
+                "vendor/lib/egl/libGLESv1_CM_angle.so",
+                "vendor/lib/egl/libGLESv2_angle.so",
+                "vendor/lib64/hw/vulkan.virtio.so",
+                "vendor/lib64/egl/libEGL_angle.so",
+                "vendor/lib64/egl/libGLESv1_CM_angle.so",
+                "vendor/lib64/egl/libGLESv2_angle.so",
+                "vendor/lib64/libgbm_mesa_wrapper.so",
+                "vendor/lib64/hw/hwcomposer.waydroid.so",
+                "system/bin/surfaceflinger",
+            )
+            for guest_file in guest_files:
+                nodes.append(
+                    "lxc.mount.entry = {}/{} {} none rbind,create=file 0 0".format(
+                        guest_root, guest_file, guest_file))
+        else:
+            # Compatibility with installations provisioned before the dual-ABI
+            # guest layout. The next setup run migrates them atomically.
+            nodes.append("lxc.mount.entry = /var/lib/waydroid/overlay/vendor/lib64/hw/vulkan.virtio.so vendor/lib64/hw/vulkan.virtio.so none rbind,create=file 0 0")
+            nodes.append("lxc.mount.entry = /var/lib/waydroid/nv/libgbm_mesa_wrapper.so vendor/lib64/libgbm_mesa_wrapper.so none rbind,create=file 0 0")
+            nodes.append("lxc.mount.entry = /var/lib/waydroid/nv/hwcomposer.waydroid.so vendor/lib64/hw/hwcomposer.waydroid.so none rbind,create=file 0 0")
+            nodes.append("lxc.mount.entry = /var/lib/waydroid/nv/libEGL_angle.so vendor/lib64/egl/libEGL_angle.so none rbind,create=file 0 0")
+            nodes.append("lxc.mount.entry = /var/lib/waydroid/nv/libGLESv1_CM_angle.so vendor/lib64/egl/libGLESv1_CM_angle.so none rbind,create=file 0 0")
+            nodes.append("lxc.mount.entry = /var/lib/waydroid/nv/libGLESv2_angle.so vendor/lib64/egl/libGLESv2_angle.so none rbind,create=file 0 0")
+            nodes.append("lxc.mount.entry = /var/lib/waydroid/nv/surfaceflinger system/bin/surfaceflinger none rbind,create=file 0 0")
+
     return nodes
 
 LXC_APPARMOR_PROFILE = "lxc-waydroid"
@@ -139,6 +180,39 @@ def get_apparmor_status(args):
     except Exception:
         enabled = False
     return enabled
+
+APPARMOR_KEYS = ("lxc.aa_profile", "lxc.apparmor.profile")
+
+def lxc_parses(config_text):
+    """lxc-info's verdict on a container config: (True, "") when this host's LXC loads it, else (False, LXC's
+    message). lxc-info parses the config of the container it describes, so a scratch container answers it."""
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix="waydroid-lxc-probe-") as tmp:
+        os.mkdir(os.path.join(tmp, "probe"))
+        with open(os.path.join(tmp, "probe", "config"), "w") as f:
+            f.write(config_text)
+        proc = subprocess.run(["lxc-info", "-P", tmp, "-n", "probe"], capture_output=True, text=True,
+                              env=dict(os.environ, LC_ALL="C"))
+    return proc.returncode == 0, proc.stderr.strip()
+
+def drop_unsupported_apparmor(config_path):
+    """An LXC built without AppArmor (Fedora's) refuses lxc.apparmor.profile ("Built without AppArmor support")
+    and then cannot load the container at all. Keep the key only when this host's LXC parses it."""
+    with open(config_path) as f:
+        lines = f.read().splitlines(True)
+    keys = [l for l in lines if l.split("=")[0].strip() in APPARMOR_KEYS]
+    if not keys:
+        return
+    ok, message = lxc_parses("")
+    if not ok:
+        raise OSError("LXC cannot load an empty container config (lxc-info -P <scratch> -n probe): " + message)
+    ok, message = lxc_parses("".join(keys))
+    if ok:
+        return
+    logging.info("LXC rejects {} ({}): leaving it out of the container config".format(
+        " / ".join(l.strip() for l in keys), message.splitlines()[0] if message else "no message"))
+    with open(config_path, "w") as f:
+        f.writelines(l for l in lines if l not in keys)
 
 def set_lxc_config(args):
     lxc_path = tools.config.defaults["lxc"] + "/waydroid"
@@ -172,6 +246,7 @@ def set_lxc_config(args):
     if get_apparmor_status(args):
         command = ["sed", "-i", "-E", "/lxc.aa_profile|lxc.apparmor.profile/ s/unconfined/{}/g".format(LXC_APPARMOR_PROFILE), lxc_path + "/config"]
         tools.helpers.run.user(args, command)
+    drop_unsupported_apparmor(lxc_path + "/config")
 
     nodes = generate_nodes_lxc_config(args)
     config_nodes_tmp_path = args.work + "/config_nodes"
